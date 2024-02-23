@@ -101,6 +101,7 @@ class NerfactoField(Field):
         use_periodic_volume_encoding: bool = False,  # [FORK]
         activation: Literal["relu", "softplus"] = "relu",  # [FORK]
         custom_implementation: bool = False,  # [FORK]
+        average_init_density: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -114,13 +115,17 @@ class NerfactoField(Field):
         self.spatial_distortion = spatial_distortion
         self.num_images = num_images
         self.appearance_embedding_dim = appearance_embedding_dim
-        self.embedding_appearance = Embedding(self.num_images, self.appearance_embedding_dim)
+        if self.appearance_embedding_dim > 0:
+            self.embedding_appearance = Embedding(self.num_images, self.appearance_embedding_dim)
+        else:
+            self.embedding_appearance = None
         self.use_average_appearance_embedding = use_average_appearance_embedding
         self.use_transient_embedding = use_transient_embedding
         self.use_semantics = use_semantics
         self.use_pred_normals = use_pred_normals
         self.pass_semantic_gradients = pass_semantic_gradients
         self.base_res = base_res
+        self.average_init_density = average_init_density
         self.step = 0
 
         self.direction_encoding = SHEncoding(
@@ -136,36 +141,51 @@ class NerfactoField(Field):
         # ADDED IN FORK #
         # ############# #
         ###################################################################################################
-        self.features_per_level = features_per_level
-        if use_periodic_volume_encoding:
-            self.mlp_base_grid = PeriodicVolumeEncoding(
-                num_levels=self.num_levels,
-                min_res=self.base_res,
-                max_res=self.max_res,
-                log2_hashmap_size=18,  # 64 ** 3 = 2^18
-                features_per_level=self.features_per_level,
-                smoothstep=True,
+        if custom_implementation:
+            self.features_per_level = features_per_level
+            if use_periodic_volume_encoding:
+                self.mlp_base_grid = PeriodicVolumeEncoding(
+                    num_levels=self.num_levels,
+                    min_res=self.base_res,
+                    max_res=self.max_res,
+                    log2_hashmap_size=18,  # 64 ** 3 = 2^18
+                    features_per_level=self.features_per_level,
+                    smoothstep=True,
+                )
+            else:
+                self.mlp_base_grid = HashEncoding(
+                    num_levels=num_levels,
+                    min_res=base_res,
+                    max_res=max_res,
+                    log2_hashmap_size=log2_hashmap_size,
+                    features_per_level=self.features_per_level,
+                    implementation=implementation,
+                )
+            self.mlp_base_mlp = MLP(
+                in_dim=self.mlp_base_grid.get_out_dim(),
+                num_layers=num_layers,
+                layer_width=hidden_dim,
+                out_dim=1 + self.geo_feat_dim,
+                activation=nn.Softplus(beta=100.0) if activation == "softplus" else nn.ReLU(),
+                out_activation=None,
+                implementation="torch",
             )
+            self.mlp_base = torch.nn.Sequential(self.mlp_base_grid, self.mlp_base_mlp)
         else:
-            self.mlp_base_grid = HashEncoding(
+            self.mlp_base = MLPWithHashEncoding(
                 num_levels=num_levels,
                 min_res=base_res,
                 max_res=max_res,
                 log2_hashmap_size=log2_hashmap_size,
-                features_per_level=self.features_per_level,
+                features_per_level=features_per_level,
+                num_layers=num_layers,
+                layer_width=hidden_dim,
+                out_dim=1 + self.geo_feat_dim,
+                activation=nn.Softplus(beta=100.0) if activation == "softplus" else nn.ReLU(),
+                out_activation=None,
                 implementation=implementation,
             )
-        self.mlp_base_mlp = MLP(
-            in_dim=self.mlp_base_grid.get_out_dim(),
-            num_layers=num_layers,
-            layer_width=hidden_dim,
-            out_dim=1 + self.geo_feat_dim,
-            activation=nn.Softplus(beta=100.0) if activation == "softplus" else nn.ReLU(),
-            out_activation=None,
-            implementation="torch" if custom_implementation else implementation,
-        )
         ###################################################################################################
-        self.mlp_base = torch.nn.Sequential(self.mlp_base_grid, self.mlp_base_mlp)
 
         # transients
         if self.use_transient_embedding:
@@ -244,7 +264,7 @@ class NerfactoField(Field):
         # Rectifying the density with an exponential is much more stable than a ReLU or
         # softplus, because it enables high post-activation (float32) density outputs
         # from smaller internal (float16) parameters.
-        density = trunc_exp(density_before_activation.to(positions))
+        density = self.average_init_density * trunc_exp(density_before_activation.to(positions))
         density = density * selector[..., None]
         return density, base_mlp_out
 
@@ -263,17 +283,19 @@ class NerfactoField(Field):
         outputs_shape = ray_samples.frustums.directions.shape[:-1]
 
         # appearance
-        if self.training:
-            embedded_appearance = self.embedding_appearance(camera_indices)
-        else:
-            if self.use_average_appearance_embedding:
-                embedded_appearance = torch.ones(
-                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
-                ) * self.embedding_appearance.mean(dim=0)
+        embedded_appearance = None
+        if self.embedding_appearance is not None:
+            if self.training:
+                embedded_appearance = self.embedding_appearance(camera_indices)
             else:
-                embedded_appearance = torch.zeros(
-                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
-                )
+                if self.use_average_appearance_embedding:
+                    embedded_appearance = torch.ones(
+                        (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
+                    ) * self.embedding_appearance.mean(dim=0)
+                else:
+                    embedded_appearance = torch.zeros(
+                        (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
+                    )
 
         # transients
         if self.use_transient_embedding and self.training:
@@ -313,8 +335,10 @@ class NerfactoField(Field):
             [
                 d,
                 density_embedding.view(-1, self.geo_feat_dim),
-                embedded_appearance.view(-1, self.appearance_embedding_dim),
-            ],
+            ]
+            + (
+                [embedded_appearance.view(-1, self.appearance_embedding_dim)] if embedded_appearance is not None else []
+            ),
             dim=-1,
         )
         rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
