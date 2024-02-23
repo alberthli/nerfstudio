@@ -101,6 +101,11 @@ method_configs["nerfacto-custom"] = TrainerConfig(
             ),
             train_num_rays_per_batch=4096,
             eval_num_rays_per_batch=4096,
+            camera_optimizer=CameraOptimizerConfig(
+                mode="SO3xR3",
+                optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2),
+                scheduler=ExponentialDecaySchedulerConfig(lr_final=6e-6, max_steps=200000),
+            ),
         ),
         model=NerfactoModelConfig(
             use_periodic_volume_encoding=True,  # [FORK]
@@ -108,7 +113,6 @@ method_configs["nerfacto-custom"] = TrainerConfig(
             custom_implementation=True,  # [FORK]
             disable_scene_contraction=True,  # [FORK]
             eval_num_rays_per_chunk=1 << 15,
-            camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
         ),
     ),
     optimizers={
@@ -120,17 +124,6 @@ method_configs["nerfacto-custom"] = TrainerConfig(
             "optimizer": AdamOptimizerConfig(lr=1e-2, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(lr_final=0.0001, max_steps=200000),
         },
-        "camera_opt": {
-            "optimizer": AdamOptimizerConfig(
-                lr=6e-4,
-                eps=1e-8,
-                weight_decay=1e-2,
-            ),
-            "scheduler": ExponentialDecaySchedulerConfig(
-                lr_final=6e-6,
-                max_steps=200000,
-            ),
-        }
     },
     viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
     vis="viewer",
@@ -149,6 +142,7 @@ method_configs["nerfacto"] = TrainerConfig(
         ),
         model=NerfactoModelConfig(
             eval_num_rays_per_chunk=1 << 15,
+            average_init_density=0.01,
             camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
         ),
     ),
@@ -192,6 +186,7 @@ method_configs["nerfacto-big"] = TrainerConfig(
             max_res=4096,
             proposal_weights_anneal_max_num_iters=5000,
             log2_hashmap_size=21,
+            average_init_density=0.01,
             camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
         ),
     ),
@@ -239,6 +234,7 @@ method_configs["nerfacto-huge"] = TrainerConfig(
             max_res=8192,
             proposal_weights_anneal_max_num_iters=5000,
             log2_hashmap_size=21,
+            average_init_density=0.01,
             camera_optimizer=CameraOptimizerConfig(mode="SO3xR3"),
         ),
     ),
@@ -652,8 +648,62 @@ method_configs["splatfacto"] = TrainerConfig(
     pipeline=VanillaPipelineConfig(
         datamanager=FullImageDatamanagerConfig(
             dataparser=NerfstudioDataParserConfig(load_3D_points=True),
+            cache_images_type="uint8",
         ),
         model=SplatfactoModelConfig(),
+    ),
+    optimizers={
+        "xyz": {
+            "optimizer": AdamOptimizerConfig(lr=1.6e-4, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(
+                lr_final=1.6e-6,
+                max_steps=30000,
+            ),
+        },
+        "features_dc": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
+            "scheduler": None,
+        },
+        "features_rest": {
+            "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+            "scheduler": None,
+        },
+        "opacity": {
+            "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+            "scheduler": None,
+        },
+        "scaling": {
+            "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+            "scheduler": None,
+        },
+        "rotation": {"optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15), "scheduler": None},
+        "camera_opt": {
+            "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+            "scheduler": ExponentialDecaySchedulerConfig(lr_final=5e-5, max_steps=30000),
+        },
+    },
+    viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
+    vis="viewer",
+)
+
+method_configs["splatfacto-big"] = TrainerConfig(
+    method_name="splatfacto",
+    steps_per_eval_image=100,
+    steps_per_eval_batch=0,
+    steps_per_save=2000,
+    steps_per_eval_all_images=1000,
+    max_num_iterations=30000,
+    mixed_precision=False,
+    gradient_accumulation_steps={"camera_opt": 100},
+    pipeline=VanillaPipelineConfig(
+        datamanager=FullImageDatamanagerConfig(
+            dataparser=NerfstudioDataParserConfig(load_3D_points=True),
+            cache_images_type="uint8",
+        ),
+        model=SplatfactoModelConfig(
+            cull_alpha_thresh=0.005,
+            continue_cull_post_densification=False,
+        ),
     ),
     optimizers={
         "xyz": {
